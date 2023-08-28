@@ -15,9 +15,20 @@ SHELL=/bin/bash -o pipefail
 GO ?= go
 
 NAME := ig
-OUTPUT := lib$(NAME).so
+OUTPUT := libfalco-plugin-$(NAME).so
+
+CONTAINER_REPO ?= ghcr.io/inspektor-gadget/falco-with-ig
+IMAGE_TAG ?= latest
+PLATFORMS ?= "linux/amd64,linux/arm64"
 
 all: $(OUTPUT)
+
+.PHONY: container-build
+container-build:
+	docker buildx build --platform=$(PLATFORMS) -t $(CONTAINER_REPO):$(IMAGE_TAG) \
+		--push \
+		-f Dockerfile .
+
 
 clean:
 	@rm -f *.so *.h

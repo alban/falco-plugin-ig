@@ -26,10 +26,9 @@ limitations under the License.
 package main
 
 import (
-	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"time"
 
 	"github.com/alecthomas/jsonschema"
@@ -37,6 +36,8 @@ import (
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk/plugins"
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk/plugins/extractor"
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk/plugins/source"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/exec/tracer"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/exec/types"
 )
 
 // Defining a type for the plugin configuration.
@@ -44,8 +45,8 @@ import (
 // counter. the `jsonschema` tags is used to automatically generate a
 // JSON Schema definition, so that the framework can perform automatic
 // validations.
-type MyPluginConfig struct {
-	Start uint64 `json:"start" jsonschema:"title=start value,description=The starting value of each counter"`
+type GadgetPluginConfig struct {
+	Gadget string `json:"gadget" jsonschema:"title=gadget image,description=The gadget image"`
 }
 
 // Defining a type for the plugin.
@@ -54,9 +55,9 @@ type MyPluginConfig struct {
 // requirements of the SDK.
 //
 // State variables to store in the plugin must be defined here.
-type MyPlugin struct {
+type GadgetPlugin struct {
 	plugins.BasePlugin
-	config   MyPluginConfig
+	config   GadgetPluginConfig
 	initTime time.Time
 }
 
@@ -69,9 +70,13 @@ type MyPlugin struct {
 //
 // State variables to store in each plugin instance must be defined here.
 // In this example, we store the internal value of the incrementing counter.
-type MyInstance struct {
+type GadgetInstance struct {
 	source.BaseInstance
-	counter uint64
+	timeout       time.Duration
+	timeoutTicker *time.Ticker
+	gadgetImage   string
+	tracer        *tracer.Tracer
+	queue         chan *types.Event
 }
 
 // The plugin must be registered to the SDK in the init() function.
@@ -83,7 +88,7 @@ type MyInstance struct {
 // compilation will fail if the mandatory methods are not implemented.
 func init() {
 	plugins.SetFactory(func() plugins.Plugin {
-		p := &MyPlugin{}
+		p := &GadgetPlugin{}
 		source.Register(p)
 		extractor.Register(p)
 		return p
@@ -93,14 +98,14 @@ func init() {
 // Info returns a pointer to a plugin.Info struct, containing all the
 // general information about this plugin.
 // This method is mandatory.
-func (m *MyPlugin) Info() *plugins.Info {
+func (m *GadgetPlugin) Info() *plugins.Info {
 	return &plugins.Info{
 		ID:          999,
-		Name:        "full-example",
-		Description: "A Plugin Example for both Source and Extraction",
-		Contact:     "github.com/falcosecurity/plugin-sdk-go/",
+		Name:        "ig",
+		Description: "Plugin fetching events from Inspektor Gadget",
+		Contact:     "github.com/inspektor-gadget/falco-plugin-ig/",
 		Version:     "0.1.0",
-		EventSource: "example",
+		EventSource: "ig",
 	}
 }
 
@@ -112,10 +117,10 @@ func (m *MyPlugin) Info() *plugins.Info {
 // This is ignored if the return value is nil. The returned schema must follow
 // the JSON Schema specific. See: https://json-schema.org/
 // This method is optional.
-func (m *MyPlugin) InitSchema() *sdk.SchemaInfo {
+func (m *GadgetPlugin) InitSchema() *sdk.SchemaInfo {
 	// We leverage the jsonschema package to autogenerate the
 	// JSON Schema definition using reflection from our config struct.
-	schema, err := jsonschema.Reflect(&MyPluginConfig{}).MarshalJSON()
+	schema, err := jsonschema.Reflect(&GadgetPluginConfig{}).MarshalJSON()
 	if err == nil {
 		return &sdk.SchemaInfo{
 			Schema: string(schema),
@@ -129,7 +134,7 @@ func (m *MyPlugin) InitSchema() *sdk.SchemaInfo {
 // that the configuration is pre-validated by the framework and
 // always well-formed according to the provided schema.
 // This method is mandatory.
-func (m *MyPlugin) Init(config string) error {
+func (m *GadgetPlugin) Init(config string) error {
 	m.initTime = time.Now()
 	// Deserialize the config json. Ignoring the error
 	// and not validating the config values is possible
@@ -143,67 +148,33 @@ func (m *MyPlugin) Init(config string) error {
 // This method is mandatory the field extraction capability.
 // If the Fields method is defined, the framework expects an Extract method
 // to be specified too.
-func (m *MyPlugin) Fields() []sdk.FieldEntry {
+func (m *GadgetPlugin) Fields() []sdk.FieldEntry {
 	return []sdk.FieldEntry{
-		{Type: "uint64", Name: "example.count", Display: "Counter value", Desc: "Current value of the internal counter"},
-		{Type: "string", Name: "example.countstr", Display: "Counter string value", Desc: "String represetation of current value of the internal counter"},
-		{Type: "bool", Name: "example.oddcount", Display: "Counter value is odd", Desc: "True if the current value of the internal counter is an odd number"},
-		{Type: "reltime", Name: "example.initduration", Display: "Time since init", Desc: "Time since the plugin was initialized"},
-		{Type: "abstime", Name: "example.evttime", Display: "Event timestamp", Desc: "Event timestamp"},
-		{Type: "ipaddr", Name: "example.ipv4addr", Display: "Sample IPv4 address", Desc: "A sample IPv4 address"},
-		{Type: "ipaddr", Name: "example.ipv6addr", Display: "Sample IPv6 address", Desc: "A sample IPv6 address"},
-		{Type: "ipnet", Name: "example.ipv4net", Display: "Sample IPv4 network", Desc: "A sample IPv4 network"},
-		{Type: "ipnet", Name: "example.ipv6net", Display: "Sample IPv6 network", Desc: "A sample IPv6 network"},
+		{Type: "string", Name: "ig.gadget", Display: "Gadget name", Desc: "Name of the gadget that generated the event"},
+		{Type: "string", Name: "ig.comm", Display: "Process name", Desc: "Name of the process"},
 	}
 }
 
 // This method is mandatory the field extraction capability.
 // If the Extract method is defined, the framework expects an Fields method
 // to be specified too.
-func (m *MyPlugin) Extract(req sdk.ExtractRequest, evt sdk.EventReader) error {
-	var value uint64
-	encoder := gob.NewDecoder(evt.Reader())
-	if err := encoder.Decode(&value); err != nil {
+func (m *GadgetPlugin) Extract(req sdk.ExtractRequest, evt sdk.EventReader) error {
+	rawData, err := io.ReadAll(evt.Reader())
+	if err != nil {
+		return err
+	}
+	var value types.Event
+	err = json.Unmarshal(rawData, &value)
+	if err != nil {
 		return err
 	}
 
 	switch req.Field() {
-	case "example.count":
-		req.SetValue(value)
+	case "ig.gadget":
+		req.SetValue("trace exec")
 		return nil
-	case "example.countstr":
-		req.SetValue(fmt.Sprintf("%d", value))
-		return nil
-	case "example.oddcount":
-		req.SetValue((value%2 == 1))
-		return nil
-	case "example.initduration":
-		req.SetValue(time.Since(m.initTime))
-		return nil
-	case "example.evttime":
-		req.SetValue(time.Unix(0, int64(evt.Timestamp())))
-		return nil
-	case "example.ipv4addr":
-		req.SetValue(net.IPv4allsys.To4())
-		return nil
-	case "example.ipv6addr":
-		req.SetValue(net.IPv6loopback)
-		return nil
-	case "example.ipv4net":
-		_, n, err := net.ParseCIDR("192.0.2.1/24")
-		if err == nil {
-			req.SetValue(n)
-		} else {
-			println(err.Error())
-		}
-		return nil
-	case "example.ipv6net":
-		_, n, err := net.ParseCIDR("2002::1234:abcd:ffff:c0a8:101/64")
-		if err == nil {
-			req.SetValue(n)
-		} else {
-			println(err.Error())
-		}
+	case "ig.comm":
+		req.SetValue(value.Comm)
 		return nil
 	default:
 		return fmt.Errorf("unsupported field: %s", req.Field())
@@ -213,19 +184,14 @@ func (m *MyPlugin) Extract(req sdk.ExtractRequest, evt sdk.EventReader) error {
 // OpenParams returns a list of suggested parameters that would be accepted
 // as valid arguments to Open().
 // This method is optional for the event sourcing capability.
-func (m *MyPlugin) OpenParams() ([]sdk.OpenParam, error) {
-	return []sdk.OpenParam{
-		{
-			Value: "file:///hello-world.bin",
-			Desc:  "A resource that can be opened by this plugin. This is not used here and just serves an example.",
-		},
-	}, nil
+func (m *GadgetPlugin) OpenParams() ([]sdk.OpenParam, error) {
+	return []sdk.OpenParam{}, nil
 }
 
 // Open opens the plugin source and starts a new capture session (e.g. stream
 // of events), creating a new plugin instance. The state of each instance can
 // be initialized here. This method is mandatory for the event sourcing capability.
-func (m *MyPlugin) Open(params string) (source.Instance, error) {
+func (m *GadgetPlugin) Open(params string) (source.Instance, error) {
 	// An event batch buffer can optionally be defined to specify custom
 	// values for max data size or max batch size. If nothing is set
 	// with the SetEvents method, the SDK will provide a default value
@@ -233,28 +199,41 @@ func (m *MyPlugin) Open(params string) (source.Instance, error) {
 	// In this example, we want to allocate a batch of max 10 events, each
 	// one of max 64 bytes, which is more than enough to host the serialized
 	// incrementing counter value.
-	myBatch, err := sdk.NewEventWriters(10, 64)
+	myBatch, err := sdk.NewEventWriters(10, int64(sdk.DefaultEvtSize))
 	if err != nil {
 		return nil, err
 	}
 
-	myInstance := &MyInstance{
-		counter: m.config.Start,
+	gadgetInstance := &GadgetInstance{
+		gadgetImage: m.config.Gadget,
+		queue:       make(chan *types.Event, 100),
+		timeout:     30 * time.Millisecond,
 	}
-	myInstance.SetEvents(myBatch)
-	return myInstance, nil
+
+	eventCallback := func(event *types.Event) {
+		gadgetInstance.queue <- event
+	}
+
+	tracer, err := tracer.NewTracer(&tracer.Config{}, nil, eventCallback)
+	if err != nil {
+		return nil, err
+	}
+
+	gadgetInstance.tracer = tracer
+	gadgetInstance.SetEvents(myBatch)
+	gadgetInstance.timeoutTicker = time.NewTicker(gadgetInstance.timeout)
+	return gadgetInstance, nil
 }
 
 // String produces a string representation of an event data produced by the
 // event source of this plugin.
 // This method is optional for the event sourcing capability.
-func (m *MyPlugin) String(evt sdk.EventReader) (string, error) {
-	var value uint64
-	encoder := gob.NewDecoder(evt.Reader())
-	if err := encoder.Decode(&value); err != nil {
+func (m *GadgetPlugin) String(evt sdk.EventReader) (string, error) {
+	evtBytes, err := io.ReadAll(evt.Reader())
+	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("counter: %d", value), nil
+	return string(evtBytes), nil
 }
 
 // NextBatch produces a batch of new events, and is called repeatedly by the
@@ -262,17 +241,26 @@ func (m *MyPlugin) String(evt sdk.EventReader) (string, error) {
 // specify a NextBatch method.
 // The batch has a maximum size that dependes on the size of the underlying
 // reusable memory buffer. A batch can be smaller than the maximum size.
-func (m *MyInstance) NextBatch(pState sdk.PluginState, evts sdk.EventWriters) (int, error) {
+func (m *GadgetInstance) NextBatch(pState sdk.PluginState, evts sdk.EventWriters) (int, error) {
+	// timeout needs to be resetted for this batch
+	m.timeoutTicker.Reset(m.timeout)
+
 	var n int
 	var evt sdk.EventWriter
 	for n = 0; n < evts.Len(); n++ {
-		evt = evts.Get(n)
-		m.counter++
-		encoder := gob.NewEncoder(evt.Writer())
-		if err := encoder.Encode(m.counter); err != nil {
-			return 0, err
+		select {
+		// an event is received, so we add it in the batch
+		case e := <-m.queue:
+			evt = evts.Get(n)
+			jsonEvent, _ := json.Marshal(e)
+			if _, err := evt.Writer().Write(jsonEvent); err != nil {
+				return n, err
+			}
+			evt.SetTimestamp(uint64(e.Timestamp))
+		// timeout hits, so we flush a partial batch
+		case <-m.timeoutTicker.C:
+			return n, sdk.ErrTimeout
 		}
-		evt.SetTimestamp(uint64(time.Now().UnixNano()))
 	}
 	return n, nil
 }
@@ -280,21 +268,22 @@ func (m *MyInstance) NextBatch(pState sdk.PluginState, evts sdk.EventWriters) (i
 // Progress returns a percentage indicator referring to the production progress
 // of the event source of this plugin.
 // This method is optional for the event sourcing capability.
-// func (m *MyInstance) Progress(pState sdk.PluginState) (float64, string) {
+// func (m *GadgetInstance) Progress(pState sdk.PluginState) (float64, string) {
 //
 // }
 
 // Close is gets called by the SDK when the plugin source capture gets closed.
 // This is useful to release any open resource used by each plugin instance.
 // This method is optional for the event sourcing capability.
-// func (m *MyInstance) Close() {
-//
-// }
+func (m *GadgetInstance) Close() {
+	m.timeoutTicker.Stop()
+	m.tracer.Stop()
+}
 
 // Destroy is gets called by the SDK when the plugin gets deinitialized.
 // This is useful to release any open resource used by the plugin.
 // This method is optional.
-// func (m *MyPlugin) Destroy() {
+// func (m *GadgetPlugin) Destroy() {
 //
 // }
 

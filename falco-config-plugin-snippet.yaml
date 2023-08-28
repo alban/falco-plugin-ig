@@ -1,0 +1,4 @@
+  - name: ig
+    library_path: libfalco-plugin-ig.so
+    init_config:
+      gadget: "/foo"
